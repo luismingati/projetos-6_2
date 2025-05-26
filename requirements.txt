@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+pandas
+pyarrow
+fsspec
+hf_transfer
+openai
+python-dotenv
+huggingface_hub
+gcsfs
+scikit-learn
+numpy
+matplotlib
+fastparquet
