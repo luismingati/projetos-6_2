@@ -13,6 +13,7 @@ import asyncio
 from supabase import Client, create_client
 from datetime import datetime
 import uuid
+from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv()
 
@@ -20,6 +21,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Clothes API", description="API para recomendação de roupas e classificação de perfil de moda")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY")
@@ -104,6 +113,17 @@ def init_db():
             upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             file_size INTEGER,
             content_type TEXT
+        )
+        '''
+    )
+    cursor.execute(
+        '''
+        CREATE TABLE IF NOT EXISTS garment_images (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            garment_dataset_id TEXT NOT NULL UNIQUE, -- Corresponde ao 'idx' do seu dataset ou ao número na imagem (ex: '0', '1', ..., '99')
+            supabase_url TEXT NOT NULL,
+            original_filename TEXT, -- Ex: 'img_0.jpg'
+            uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         '''
     )
@@ -211,6 +231,106 @@ async def gen_title_description(text_value: str, image_id: str) -> dict:
         parsed = OpenAIClothTitleDescriptionResponse.model_validate_json(data)
         return {"title": parsed.title, "description": parsed.description}
 
+# ... (importações e configurações existentes) ...
+
+async def upload_local_garment_images_to_supabase(
+    local_image_directory: str = "images", 
+    image_prefix: str = "img_", 
+    image_extension: str = ".jpg", 
+    num_images: int = 1000 # Suas 100 imagens leves
+):
+    """
+    Faz upload de imagens locais (ex: img_0.jpg, ..., img_99.jpg) para o Supabase
+    e salva suas URLs públicas no banco de dados SQLite.
+    """
+    if not os.path.isdir(local_image_directory):
+        logger.error(f"Diretório de imagens locais '{local_image_directory}' não encontrado.")
+        return {"error": f"Diretório '{local_image_directory}' não encontrado."}
+
+    conn = sqlite3.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    
+    uploaded_count = 0
+    failed_uploads = []
+
+    for i in range(num_images):
+        original_filename = f"{image_prefix}{i}{image_extension}" # ex: img_0.jpg
+        local_file_path = os.path.join(local_image_directory, original_filename)
+        garment_dataset_id = str(i) # ID que será usado para buscar no dataset/tabela
+
+        if not os.path.exists(local_file_path):
+            logger.warning(f"Arquivo de imagem local não encontrado: {local_file_path}")
+            failed_uploads.append({"filename": original_filename, "reason": "Arquivo local não encontrado"})
+            continue
+
+        try:
+            with open(local_file_path, "rb") as f:
+                file_content = f.read()
+            
+            # Determina o content-type (simples, pode ser melhorado)
+            content_type = "image/jpeg" if image_extension.lower() == ".jpg" else "image/png"
+            
+            # Cria um nome de arquivo único para o Supabase para evitar colisões
+            supabase_filename = f"garments/{generate_unique_filename(original_filename)}"
+
+            # Upload para o Supabase
+            upload_result = supabase.storage.from_(SUPABASE_BUCKET_NAME).upload(
+                path=supabase_filename,
+                file=file_content,
+                file_options={
+                    "content-type": content_type,
+                    "upsert": "true"
+                },
+            )
+            
+            public_url = supabase.storage.from_(SUPABASE_BUCKET_NAME).get_public_url(supabase_filename)
+            
+            try:
+                cursor.execute(
+                    """
+                    INSERT INTO garment_images (garment_dataset_id, supabase_url, original_filename)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(garment_dataset_id) DO UPDATE SET
+                    supabase_url = excluded.supabase_url,
+                    original_filename = excluded.original_filename,
+                    uploaded_at = CURRENT_TIMESTAMP
+                    """,
+                    (garment_dataset_id, public_url, original_filename)
+                )
+                conn.commit()
+                uploaded_count += 1
+                logger.info(f"Upload bem-sucedido e DB atualizado para: {original_filename} -> {public_url}")
+            except sqlite3.Error as db_err:
+                logger.error(f"Erro ao salvar no DB para {original_filename}: {db_err}")
+                failed_uploads.append({"filename": original_filename, "reason": f"Erro no DB: {db_err}"})
+
+        except Exception as e:
+            logger.error(f"Erro durante o upload de {original_filename}: {e}")
+            failed_uploads.append({"filename": original_filename, "reason": f"Erro no upload: {str(e)}"})
+
+    conn.close()
+    
+    summary = {
+        "message": f"Processo de upload concluído. {uploaded_count} imagens processadas com sucesso.",
+        "uploaded_successfully": uploaded_count,
+        "failed_uploads_count": len(failed_uploads),
+        "failures": failed_uploads
+    }
+    logger.info(summary)
+    return summary
+
+@app.post("/admin/upload-local-garments")
+async def trigger_local_garment_upload():
+    """
+    [ADMIN] Endpoint para fazer upload das imagens da pasta /images para o Supabase.
+    Use com cautela e preferencialmente apenas uma vez.
+    NAO USAR A MENOS QUE PRECISE FAZER UPLOAD NOVAMENTE PARA O SUPABASE
+    """
+    
+    logger.info("Iniciando upload de imagens locais de vestuário para o Supabase...")
+    result = await upload_local_garment_images_to_supabase(num_images=1000) # Ajuste num_images conforme necessário
+    return result
+    
 @app.get("/clothes", response_model=List[ClothItemDetail])
 async def get_random_clothes():
     if df_clothes_dataset is None:
@@ -219,46 +339,81 @@ async def get_random_clothes():
         return []
 
     sample_df = df_clothes_dataset.sample(min(10, len(df_clothes_dataset)))
-    tasks = []
+    
+    tasks_openai = []
+    # Coletar IDs para buscar URLs do Supabase de uma vez, se possível, ou conectar uma vez
+    
     for idx, row in sample_df.iterrows():
         text_value = row.get("text", "")
         if isinstance(text_value, bytes):
             text_value = text_value.decode("utf-8", "replace")
-        image_id = str(idx)
+        
+        # O 'id' da roupa no seu dataset. Usaremos para a OpenAI e para buscar a URL no Supabase.
+        current_garment_id = str(idx) 
 
-        # cria a _task_ mas não aguarda ainda
-        tasks.append(
-            gen_title_description(text_value, image_id)
+        # Adiciona a task para a OpenAI
+        tasks_openai.append(
+            gen_title_description(text_value, current_garment_id) # A função gen_title_description já existe no seu código
         )
 
-    # executa TUDO em paralelo e espera até todas terminarem
-    openai_results = await asyncio.gather(*tasks, return_exceptions=True)
+    # Executa todas as chamadas à OpenAI em paralelo
+    openai_results = await asyncio.gather(*tasks_openai, return_exceptions=True)
 
     results = []
-    for (idx, row), od in zip(sample_df.iterrows(), openai_results):
-        title = "Título não gerado"
-        desc  = "Descrição não gerada"
-        if isinstance(od, Exception):
-            logger.error(f"OpenAI erro idx={idx}: {od}")
-        else:
-            title = od["title"]
-            desc  = od["description"]
+    # Abre a conexão com o SQLite uma vez para buscar as URLs
+    conn_sqlite = None
+    try:
+        conn_sqlite = sqlite3.connect(DATABASE_URL)
+        cursor_sqlite = conn_sqlite.cursor()
 
-        # lógica de image_url (igual ao que você já tinha)
-        expected = f"img_{idx}.jpg"
-        path = os.path.join("images", expected)
-        image_url = f"/static_images/{expected}" if os.path.exists(path) else "/static_images/default_image_placeholder.png"
+        # Itera sobre os resultados do dataset e os resultados da OpenAI
+        for (idx, row), openai_data in zip(sample_df.iterrows(), openai_results):
+            title = "Título não gerado"
+            description  = "Descrição não gerada"
+            
+            if isinstance(openai_data, Exception):
+                logger.error(f"Erro na chamada OpenAI para o item com idx={idx}: {openai_data}")
+            elif openai_data: # Verifica se openai_data não é None ou uma exceção já tratada
+                title = openai_data.get("title", title)
+                description = openai_data.get("description", description)
 
-        results.append(ClothItemDetail(
-            id=str(idx),
-            image_url=image_url,
-            title=title,
-            description=desc,
-            original_text=row.get("text", "")
-        ))
+            garment_id_str = str(idx) 
+            image_url = "/static_images/default_image_placeholder.png" # URL Padrão
 
+            cursor_sqlite.execute(
+                "SELECT supabase_url FROM garment_images WHERE garment_dataset_id = ?",
+                (garment_id_str,)
+            )
+            url_row = cursor_sqlite.fetchone()
+
+            if url_row and url_row[0]:
+                image_url = url_row[0]
+            else:
+                logger.warning(f"URL do Supabase NÃO encontrada para garment_id {garment_id_str}. Usando placeholder.")
+
+
+            original_text_value = row.get("text", "")
+            if isinstance(original_text_value, bytes):
+                original_text_value = original_text_value.decode("utf-8", "replace")
+
+            results.append(ClothItemDetail(
+                id=garment_id_str,
+                image_url=image_url,
+                title=title,
+                description=description,
+                original_text=original_text_value
+            ))
+    
+    except sqlite3.Error as e:
+        logger.error(f"Erro de banco de dados ao buscar URLs de imagem: {e}")
+        if not results:
+             raise HTTPException(status_code=500, detail="Erro ao acessar dados das imagens.")
+
+    finally:
+        if conn_sqlite:
+            conn_sqlite.close()
+            
     return results
-
 
 @app.post("/clothes")
 def save_image_ids(image_data: ImageIDs):
