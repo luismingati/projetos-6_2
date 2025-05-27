@@ -178,7 +178,6 @@ class ClothItemDetail(BaseModel):
     image_url: str             # Alterado de image_representation para image_url
     title: str
     description: str
-    original_text: Optional[str] = None
 
 
 def get_features_schema():
@@ -198,40 +197,32 @@ PROFILE_DESCRIPTIONS = {
     'Aventureiro Fashion': "Seu estilo é marcado por estampas criativas, texturas interessantes e uma vontade de explorar o novo. Você vê a moda como uma forma de aventura e autoexpressão, sempre em busca de peças únicas que contem uma história."
 }
 
-async def gen_title_description(text_value: str, image_id: str) -> dict:
-    """Faz a chamada ao OpenAI e retorna um dict com title e description."""
-    system_prompt = (
-        "Você é um assistente de IA especialista em moda. Sua tarefa é analisar a descrição "
-        "e gerar um JSON com 'title' e 'description' em PT-BR."
-    )
-    user_prompt = f"Descrição da peça: '{text_value}'"
-    try:
-        resp = await client.chat.completions.acreate(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            response_format={"type": "json_object"}
-        )
-        data = resp.choices[0].message.content
-        parsed = OpenAIClothTitleDescriptionResponse.model_validate_json(data)
-        return {"title": parsed.title, "description": parsed.description}
-    except AttributeError:
-        result = await asyncio.to_thread(
-            client.chat.completions.create,
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            response_format={"type": "json_object"}
-        )
-        data = result.choices[0].message.content
-        parsed = OpenAIClothTitleDescriptionResponse.model_validate_json(data)
-        return {"title": parsed.title, "description": parsed.description}
+class ImageClassification(BaseModel):
+    title: str
+    description: str
 
-# ... (importações e configurações existentes) ...
+async def gen_title_description(image_url: str, image_id: str) -> dict:
+    system_prompt = (
+        "Você é um assistente de IA especialista em moda. "
+        "Receba a URL da imagem do produto e gere um JSON com campos 'title' e 'description' em PT-BR. "
+        "O 'title' deve ser um título conciso e descritivo, destacando a peça (máx. 5 palavras). "
+        "A 'description' deve descrever material, cores, estampas e modelagem (máx. 2 frases)."
+    )
+    # usa thread pool para não bloquear
+    resp = await asyncio.to_thread(
+        client.responses.parse,
+        model="gpt-4o-mini",
+        input=[{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": system_prompt},
+                {"type": "input_image", "image_url": image_url},
+            ],
+        }],
+        text_format=ImageClassification,
+    )
+    data = resp.output_parsed
+    return {"title": data.title, "description": data.description}
 
 async def upload_local_garment_images_to_supabase(
     local_image_directory: str = "images", 
@@ -333,142 +324,79 @@ async def trigger_local_garment_upload():
     
 @app.get("/clothes", response_model=List[ClothItemDetail])
 async def get_random_clothes():
-    if df_clothes_dataset is None:
-        raise HTTPException(status_code=503, detail="Dataset não carregado.")
-    if df_clothes_dataset.empty:
-        return []
+    if df_clothes_dataset is None or df_clothes_dataset.empty:
+        raise HTTPException(status_code=503, detail="Dataset não carregado ou vazio.")
 
     sample_df = df_clothes_dataset.sample(min(10, len(df_clothes_dataset)))
-    
-    tasks_openai = []
-    # Coletar IDs para buscar URLs do Supabase de uma vez, se possível, ou conectar uma vez
-    
-    for idx, row in sample_df.iterrows():
-        text_value = row.get("text", "")
-        if isinstance(text_value, bytes):
-            text_value = text_value.decode("utf-8", "replace")
-        
-        # O 'id' da roupa no seu dataset. Usaremos para a OpenAI e para buscar a URL no Supabase.
-        current_garment_id = str(idx) 
+    conn = sqlite3.connect(DATABASE_URL)
+    cursor = conn.cursor()
 
-        # Adiciona a task para a OpenAI
-        tasks_openai.append(
-            gen_title_description(text_value, current_garment_id) # A função gen_title_description já existe no seu código
+    tasks = []
+    items = []
+    for idx, _ in sample_df.iterrows():
+        garment_id = str(idx)
+        cursor.execute(
+            "SELECT supabase_url FROM garment_images WHERE garment_dataset_id = ?",
+            (garment_id,)
         )
+        row = cursor.fetchone()
+        image_url = row[0] if row and row[0] else "/static_images/default_image_placeholder.png"
+        # dispara a corrotina sem bloqueio
+        tasks.append(gen_title_description(image_url, garment_id))
+        items.append({"id": garment_id, "image_url": image_url})
+    conn.close()
 
-    # Executa todas as chamadas à OpenAI em paralelo
-    openai_results = await asyncio.gather(*tasks_openai, return_exceptions=True)
+    openai_results = await asyncio.gather(*tasks, return_exceptions=True)
 
     results = []
-    # Abre a conexão com o SQLite uma vez para buscar as URLs
-    conn_sqlite = None
-    try:
-        conn_sqlite = sqlite3.connect(DATABASE_URL)
-        cursor_sqlite = conn_sqlite.cursor()
-
-        # Itera sobre os resultados do dataset e os resultados da OpenAI
-        for (idx, row), openai_data in zip(sample_df.iterrows(), openai_results):
-            title = "Título não gerado"
-            description  = "Descrição não gerada"
-            
-            if isinstance(openai_data, Exception):
-                logger.error(f"Erro na chamada OpenAI para o item com idx={idx}: {openai_data}")
-            elif openai_data: # Verifica se openai_data não é None ou uma exceção já tratada
-                title = openai_data.get("title", title)
-                description = openai_data.get("description", description)
-
-            garment_id_str = str(idx) 
-            image_url = "/static_images/default_image_placeholder.png" # URL Padrão
-
-            cursor_sqlite.execute(
-                "SELECT supabase_url FROM garment_images WHERE garment_dataset_id = ?",
-                (garment_id_str,)
-            )
-            url_row = cursor_sqlite.fetchone()
-
-            if url_row and url_row[0]:
-                image_url = url_row[0]
-            else:
-                logger.warning(f"URL do Supabase NÃO encontrada para garment_id {garment_id_str}. Usando placeholder.")
-
-
-            original_text_value = row.get("text", "")
-            if isinstance(original_text_value, bytes):
-                original_text_value = original_text_value.decode("utf-8", "replace")
-
-            results.append(ClothItemDetail(
-                id=garment_id_str,
-                image_url=image_url,
-                title=title,
-                description=description,
-                original_text=original_text_value
-            ))
-    
-    except sqlite3.Error as e:
-        logger.error(f"Erro de banco de dados ao buscar URLs de imagem: {e}")
-        if not results:
-             raise HTTPException(status_code=500, detail="Erro ao acessar dados das imagens.")
-
-    finally:
-        if conn_sqlite:
-            conn_sqlite.close()
-            
+    for item, res in zip(items, openai_results):
+        title = "Título não gerado"
+        description = "Descrição não gerada"
+        if not isinstance(res, Exception):
+            title = res.get("title", title)
+            description = res.get("description", description)
+        results.append(ClothItemDetail(
+            id=item["id"],
+            image_url=item["image_url"],
+            title=title,
+            description=description
+        ))
     return results
 
 @app.post("/clothes")
 def save_image_ids(image_data: ImageIDs):
-    """Recebe uma lista de IDs de imagem, classifica suas features usando OpenAI,
-    determina o perfil de moda usando RandomForest e salva no banco de dados."""
     if not all([pipeline_model, cluster_names_map, rf_model]):
         raise HTTPException(status_code=503, detail="Modelos de classificação não estão prontos. Tente novamente mais tarde.")
-
     conn = sqlite3.connect(DATABASE_URL)
     cursor = conn.cursor()
     saved_count = 0
     errors = []
-
     for raw_id_str in image_data.ids:
         try:
             idx = int(raw_id_str)
         except ValueError:
             errors.append(f"ID inválido (não numérico): {raw_id_str}")
             continue
-
-        if df_clothes_dataset is None or 'text' not in df_clothes_dataset.columns:
-            errors.append(f"Dataset de roupas não carregado ou coluna 'text' ausente para ID {idx}.")
-            continue
-        if idx not in df_clothes_dataset.index:
-            errors.append(f"ID {idx} não encontrado no dataset de roupas.")
-            continue
-
-        text_value = df_clothes_dataset.loc[idx, 'text']
-        if isinstance(text_value, bytes):
-            text_value = text_value.decode('utf-8', errors='replace')
-
-
+        cursor.execute(
+            "SELECT supabase_url FROM garment_images WHERE garment_dataset_id = ?",
+            (str(idx),)
+        )
+        row = cursor.fetchone()
+        image_url = row[0] if row and row[0] else "/static_images/default_image_placeholder.png"
         try:
             openai_response = client.chat.completions.create(
-                model="gpt-4o-mini", 
+                model="gpt-4o-mini",
                 messages=[
-                    {"role": "system", "content": (
-                        "Você é um assistente que analisa descrições de roupas e atribui pontuações de 1 a 10 para 5 características de estilo: "
-                        "'cores_vivas', 'versatilidade', 'conforto', 'formalidade', 'estampas'. "
-                        "Responda estritamente no formato JSON especificado."
-                    )},
-                    {"role": "user", "content": f"Analise esta descrição de roupa: '{text_value}'"}
+                    {"role": "system", "content": "Você é um assistente que analisa imagens de roupas e atribui pontuações de 1 a 10 para 5 características de estilo: 'cores_vivas', 'versatilidade', 'conforto', 'formalidade', 'estampas'. Responda estritamente no formato JSON especificado."},
+                    {"role": "user", "content": f"Classifique esta imagem de roupa: {image_url}"}
                 ],
-                response_format={
-                    "type": "json_object", 
-                }
+                response_format={"type": "json_object"}
             )
             content_str = openai_response.choices[0].message.content
             features = ClothingFeatures.model_validate_json(content_str)
-
         except Exception as e:
-            logger.error(f"Erro na chamada OpenAI para ID {idx} ('{text_value}'): {e}")
             errors.append(f"Falha na OpenAI para ID {idx}: {str(e)}")
             continue
-
         try:
             features_array = np.array([[
                 features.cores_vivas,
@@ -477,25 +405,17 @@ def save_image_ids(image_data: ImageIDs):
                 features.formalidade,
                 features.estampas
             ]])
-            
             predicted_cluster_id = int(rf_model.predict(features_array)[0])
             predicted_profile_name = cluster_names_map.get(predicted_cluster_id, "Desconhecido")
-
         except Exception as e:
-            logger.error(f"Erro ao classificar perfil para ID {idx} com RandomForest: {e}")
             errors.append(f"Erro na classificação do perfil para ID {idx}: {str(e)}")
-            predicted_cluster_id = None 
+            predicted_cluster_id = None
             predicted_profile_name = "Erro na Classificação"
-
-
         try:
             cursor.execute(
-                """
-                INSERT OR IGNORE INTO saved_ids
-                  (image_id, text, cores_vivas, versatilidade, conforto, formalidade, estampas, cluster_id, cluster_name)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    str(idx), text_value,
+                "INSERT OR IGNORE INTO saved_ids (image_id, text, cores_vivas, versatilidade, conforto, formalidade, estampas, cluster_id, cluster_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    str(idx), image_url,
                     features.cores_vivas, features.versatilidade, features.conforto,
                     features.formalidade, features.estampas,
                     predicted_cluster_id, predicted_profile_name
@@ -504,12 +424,9 @@ def save_image_ids(image_data: ImageIDs):
             if cursor.rowcount > 0:
                 saved_count += 1
         except sqlite3.Error as db_e:
-            logger.error(f"Erro no DB ao salvar ID {idx}: {db_e}")
             errors.append(f"Erro no DB para ID {idx}: {db_e}")
-
     conn.commit()
     conn.close()
-
     if errors:
         return {
             "message": f"{saved_count} de {len(image_data.ids)} IDs processados. Alguns com sucesso.",
@@ -517,9 +434,7 @@ def save_image_ids(image_data: ImageIDs):
             "errors_occurred": len(errors),
             "error_details": errors
         }
-
     return {"message": f"{saved_count} de {len(image_data.ids)} IDs salvos com sucesso."}
-
 
 @app.post("/classify_profile", response_model=ProfileResponse)
 def classify_user_profile(user_data: UserProfileInput):
