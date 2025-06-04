@@ -364,7 +364,7 @@ async def get_random_clothes():
     return results
 
 @app.post("/clothes")
-def save_image_ids(image_data: ImageIDs):
+async def save_image_ids(image_data: ImageIDs):
     if not all([pipeline_model, cluster_names_map, rf_model]):
         raise HTTPException(status_code=503, detail="Modelos de classificação não estão prontos. Tente novamente mais tarde.")
     conn = sqlite3.connect(DATABASE_URL)
@@ -384,16 +384,19 @@ def save_image_ids(image_data: ImageIDs):
         row = cursor.fetchone()
         image_url = row[0] if row and row[0] else "/static_images/default_image_placeholder.png"
         try:
-            openai_response = client.chat.completions.create(
+            resp = await asyncio.to_thread(
+                client.responses.parse,
                 model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "Você é um assistente que analisa imagens de roupas e atribui pontuações de 1 a 10 para 5 características de estilo: 'cores_vivas', 'versatilidade', 'conforto', 'formalidade', 'estampas'. Responda estritamente no formato JSON especificado."},
-                    {"role": "user", "content": f"Classifique esta imagem de roupa: {image_url}"}
-                ],
-                response_format={"type": "json_object"}
+                input=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Você é um assistente que analisa imagens de roupas e atribui pontuações de 1 a 10 para 5 características de estilo: 'cores_vivas', 'versatilidade', 'conforto', 'formalidade', 'estampas'. Responda estritamente no formato JSON especificado."},
+                        {"type": "input_image", "image_url": image_url},
+                    ],
+                }],
+               text_format=ClothingFeatures,
             )
-            content_str = openai_response.choices[0].message.content
-            features = ClothingFeatures.model_validate_json(content_str)
+            features = resp.output_parsed
         except Exception as e:
             errors.append(f"Falha na OpenAI para ID {idx}: {str(e)}")
             continue
@@ -544,18 +547,19 @@ def validate_image_file(file: UploadFile) -> bool:
 @app.post("/upload-images", response_model=UploadResponse)
 async def upload_images_to_supabase(files: List[UploadFile] = File(...)):
     """
-    Endpoint para fazer upload de múltiplas imagens para o Supabase Storage.
+    Endpoint para fazer upload de múltiplas imagens para o Supabase Storage,
+    e classificar cada imagem com notas e perfil usando OpenAI e RandomForest.
     
     Args:
         files: Lista de arquivos de imagem para upload
         
     Returns:
-        UploadResponse com detalhes dos arquivos enviados e falhas
+        UploadResponse com detalhes dos arquivos enviados, falhas e classificações
     """
     uploaded_files = []
     failed_files = []
     
-    # Conecta ao banco local para registrar uploads
+    # Conecta ao banco local para registrar uploads e classificações
     conn = sqlite3.connect(DATABASE_URL)
     cursor = conn.cursor()
     
@@ -579,19 +583,18 @@ async def upload_images_to_supabase(files: List[UploadFile] = File(...)):
             
             # Faz upload para o Supabase Storage
             try:
-                upload_result = supabase.storage.from_(SUPABASE_BUCKET_NAME).upload(
+                supabase.storage.from_(SUPABASE_BUCKET_NAME).upload(
                     path=supabase_path,
                     file=file_content,
                     file_options={
                         "content-type": file.content_type,
-                        "upsert": False  # Não sobrescreve arquivos existentes
+                        "upsert": False
                     }
                 )
                 
                 # Gera URL pública do arquivo
                 public_url = supabase.storage.from_(SUPABASE_BUCKET_NAME).get_public_url(supabase_path)
-                
-                # Salva informações no banco local
+                # Salva informações da imagem no banco local
                 cursor.execute(
                     """
                     INSERT INTO uploaded_images 
@@ -601,6 +604,59 @@ async def upload_images_to_supabase(files: List[UploadFile] = File(...)):
                     (file.filename, supabase_path, public_url, file_size, file.content_type)
                 )
                 
+                # Classifica a imagem recém-carregada usando OpenAI e RandomForest
+                try:
+                    resp = await asyncio.to_thread(
+                        client.responses.parse,
+                        model="gpt-4o-mini",
+                        input=[{
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": (
+                                        "Você é um assistente que analisa imagens de roupas e atribui pontuações "
+                                        "de 1 a 10 para 5 características de estilo: 'cores_vivas', 'versatilidade', "
+                                        "'conforto', 'formalidade', 'estampas'. Responda estritamente no formato JSON."
+                                    )
+                                },
+                                {"type": "input_image", "image_url": public_url},
+                            ],
+                        }],
+                        text_format=ClothingFeatures,
+                    )
+                    features = resp.output_parsed
+                    print(features)
+                    features_array = np.array([[
+                        features.cores_vivas,
+                        features.versatilidade,
+                        features.conforto,
+                        features.formalidade,
+                        features.estampas
+                    ]])
+                    predicted_cluster_id = int(rf_model.predict(features_array)[0])
+                    predicted_profile_name = cluster_names_map.get(predicted_cluster_id, "Desconhecido")
+                    # Insere a classificação no saved_ids
+                    cursor.execute(
+                        """
+                        INSERT OR IGNORE INTO saved_ids
+                        (image_id, text, cores_vivas, versatilidade, conforto, formalidade, estampas, cluster_id, cluster_name)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            unique_filename, public_url,
+                            features.cores_vivas, features.versatilidade, features.conforto,
+                            features.formalidade, features.estampas,
+                            predicted_cluster_id, predicted_profile_name
+                        )
+                    )
+                    print("caceta")
+                except Exception:
+                    print("erro nessa caceta")
+                    # Se falhar na classificação, ignora sem interromper o upload
+                    pass
+                
+                conn.commit()
                 uploaded_files.append({
                     "original_filename": file.filename,
                     "supabase_path": supabase_path,
@@ -608,7 +664,7 @@ async def upload_images_to_supabase(files: List[UploadFile] = File(...)):
                     "file_size": f"{file_size} bytes"
                 })
                 
-                logger.info(f"Upload bem-sucedido: {file.filename} -> {supabase_path}")
+                logger.info(f"Upload e classificação bem-sucedidos: {file.filename} -> {supabase_path}")
                 
             except Exception as supabase_error:
                 failed_files.append({
